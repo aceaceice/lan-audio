@@ -227,8 +227,10 @@ pub struct JitterBuffer {
     target_latency_ms: f32,
     smoothed_fill_frames: f32,
     resample_phase: f64,
+    last_pushed_frame: [f32; 2],
     last_frame: [f32; 2],
     primed: bool,
+    empty_run_frames: usize,
     last_seq: Option<u32>,
     pub packets_received: u64,
     pub packets_lost: u64,
@@ -237,7 +239,7 @@ pub struct JitterBuffer {
 
 impl JitterBuffer {
     pub fn new(output_sample_rate: u32, target_latency_ms: f32) -> Self {
-        let cap = ((output_sample_rate as usize) * 2).max(8192);
+        let cap = ((output_sample_rate as usize) * 2).max(16384);
         Self {
             queue: VecDeque::with_capacity(cap),
             sender_sample_rate: output_sample_rate,
@@ -245,8 +247,10 @@ impl JitterBuffer {
             target_latency_ms: target_latency_ms.clamp(5.0, 500.0),
             smoothed_fill_frames: 0.0,
             resample_phase: 0.0,
+            last_pushed_frame: [0.0, 0.0],
             last_frame: [0.0, 0.0],
             primed: false,
+            empty_run_frames: 0,
             last_seq: None,
             packets_received: 0,
             packets_lost: 0,
@@ -266,6 +270,9 @@ impl JitterBuffer {
     }
 
     pub fn push_packet(&mut self, hdr: &AudioHeader, frames: &[[f32; 2]]) {
+        if frames.is_empty() {
+            return;
+        }
         if hdr.sample_rate >= 8000 && hdr.sample_rate <= 192_000 {
             self.sender_sample_rate = hdr.sample_rate;
         }
@@ -274,75 +281,106 @@ impl JitterBuffer {
         if let Some(prev) = self.last_seq {
             let expected = prev.wrapping_add(1);
             if hdr.seq != expected {
-                let diff = hdr.seq.wrapping_sub(expected);
-                if diff < 1000 {
-                    self.packets_lost += diff as u64;
+                let forward_diff = hdr.seq.wrapping_sub(expected);
+                let backward_diff = prev.wrapping_sub(hdr.seq);
+                if backward_diff < 500 && hdr.seq > 10 {
+                    // Out-of-order or duplicate old packet: drop it so it doesn't corrupt timeline
+                    return;
+                } else if forward_diff <= 6 {
+                    // 1..=6 packets lost over Wi-Fi: conceal missing frames smoothly so buffer doesn't dip
+                    self.packets_lost += forward_diff as u64;
+                    let missing_frames = (forward_diff as usize) * frames.len();
+                    let first_new = frames[0];
+                    for i in 0..missing_frames {
+                        let t = (i + 1) as f32 / (missing_frames + 1) as f32;
+                        let atten = 1.0 - (0.35 * t);
+                        let l = (self.last_pushed_frame[0]
+                            + (first_new[0] - self.last_pushed_frame[0]) * t)
+                            * atten;
+                        let r = (self.last_pushed_frame[1]
+                            + (first_new[1] - self.last_pushed_frame[1]) * t)
+                            * atten;
+                        self.queue.push_back([l, r]);
+                    }
+                } else if forward_diff < 2000 {
+                    self.packets_lost += forward_diff as u64;
                 }
             }
         }
         self.last_seq = Some(hdr.seq);
 
-        let target_frames =
-            ((self.target_latency_ms * 0.001) * (self.sender_sample_rate as f32)).max(240.0);
-        let max_frames = (target_frames * 3.0).max(target_frames + 1440.0) as usize;
-
         for &frame in frames {
             self.queue.push_back(frame);
         }
-
-        // Hard bound if burst/stall accumulated too many frames
-        if self.queue.len() > max_frames {
-            let drop_count = self.queue.len() - (target_frames as usize);
-            self.queue.drain(..drop_count);
-            self.smoothed_fill_frames = target_frames;
+        if let Some(&last) = frames.last() {
+            self.last_pushed_frame = last;
         }
 
-        if !self.primed && (self.queue.len() as f32) >= target_frames * 0.75 {
+        let target_frames =
+            ((self.target_latency_ms * 0.001) * (self.sender_sample_rate as f32)).max(480.0);
+        // Generous ceiling (~200ms or 5x target) so normal Wi-Fi bursts are absorbed by smooth resampling, not hard cuts
+        let max_frames = ((target_frames * 5.0) as usize).max((self.sender_sample_rate as usize) / 5);
+
+        if self.queue.len() > max_frames {
+            let keep = (target_frames * 1.25) as usize;
+            let drop_count = self.queue.len().saturating_sub(keep);
+            self.queue.drain(..drop_count);
+            // Crossfade the seam over 32 frames to prevent any click
+            let n = self.queue.len().min(32);
+            for i in 0..n {
+                let t = i as f32 / n as f32;
+                let q = self.queue[i];
+                self.queue[i] = [
+                    self.last_frame[0] * (1.0 - t) + q[0] * t,
+                    self.last_frame[1] * (1.0 - t) + q[1] * t,
+                ];
+            }
+            self.smoothed_fill_frames = keep as f32;
+        }
+
+        if !self.primed && (self.queue.len() as f32) >= target_frames {
             self.primed = true;
+            self.empty_run_frames = 0;
             self.smoothed_fill_frames = self.queue.len() as f32;
         }
     }
 
     /// Pull `out_frames.len()` stereo frames at `self.output_sample_rate` with volume scaling
     pub fn pop_output_frames(&mut self, out_frames: &mut [[f32; 2]], volume: f32) {
-        if !self.primed || self.queue.len() < 2 {
-            if self.primed {
-                self.primed = false;
-                self.underruns += 1;
-            }
-            // Smoothly decay last sample to zero to avoid audible click
+        if !self.primed {
             for frame in out_frames.iter_mut() {
-                self.last_frame[0] *= 0.92;
-                self.last_frame[1] *= 0.92;
+                self.last_frame[0] *= 0.992;
+                self.last_frame[1] *= 0.992;
                 *frame = [self.last_frame[0] * volume, self.last_frame[1] * volume];
             }
             return;
         }
 
-        let target_frames =
-            ((self.target_latency_ms * 0.001) * (self.sender_sample_rate as f32)).max(240.0);
+        // Ensure target_frames is always larger than 1.5x callback chunk size
+        let min_target = (out_frames.len() as f32 * 1.5).max(480.0);
+        let target_frames = ((self.target_latency_ms * 0.001) * (self.sender_sample_rate as f32))
+            .max(min_target);
         let current_fill = self.queue.len() as f32;
-        self.smoothed_fill_frames = 0.98 * self.smoothed_fill_frames + 0.02 * current_fill;
+        self.smoothed_fill_frames = 0.985 * self.smoothed_fill_frames + 0.015 * current_fill;
 
-        // Gentle proportional drift control (clamped to +/- 0.25% pitch shift)
+        // Smooth proportional drift control (clamped to +/- 0.35% pitch shift)
         let fill_error = (self.smoothed_fill_frames - target_frames) / target_frames.max(1.0);
-        let drift_factor = (1.0 + (fill_error * 0.0015).clamp(-0.0025, 0.0025)) as f64;
+        let drift_factor = (1.0 + (fill_error * 0.002).clamp(-0.0035, 0.0035)) as f64;
         let base_ratio = (self.sender_sample_rate as f64) / (self.output_sample_rate.max(1) as f64);
         let step = base_ratio * drift_factor;
 
+        let mut had_underrun_in_chunk = false;
+
         for out in out_frames.iter_mut() {
-            while self.resample_phase >= 1.0 {
+            while self.resample_phase >= 1.0 && !self.queue.is_empty() {
                 self.resample_phase -= 1.0;
                 if let Some(f) = self.queue.pop_front() {
                     self.last_frame = f;
-                } else {
-                    self.primed = false;
-                    self.underruns += 1;
-                    break;
                 }
             }
 
             if self.queue.len() >= 2 {
+                self.empty_run_frames = 0;
                 let f0 = self.queue[0];
                 let f1 = self.queue[1];
                 let t = self.resample_phase as f32;
@@ -354,11 +392,39 @@ impl JitterBuffer {
                     (r * volume).clamp(-1.0, 1.0),
                 ];
                 self.resample_phase += step;
+            } else if let Some(&f0) = self.queue.front() {
+                self.empty_run_frames = 0;
+                self.last_frame = f0;
+                *out = [
+                    (f0[0] * volume).clamp(-1.0, 1.0),
+                    (f0[1] * volume).clamp(-1.0, 1.0),
+                ];
+                self.queue.pop_front();
+                self.resample_phase = 0.0;
             } else {
-                self.last_frame[0] *= 0.95;
-                self.last_frame[1] *= 0.95;
-                *out = [self.last_frame[0] * volume, self.last_frame[1] * volume];
+                // Momentary starvation: smoothly decay last sample without dropping `primed` unless stream stopped (>40ms)
+                if self.empty_run_frames == 0 {
+                    had_underrun_in_chunk = true;
+                }
+                self.empty_run_frames += 1;
+                self.last_frame[0] *= 0.994;
+                self.last_frame[1] *= 0.994;
+                *out = [
+                    (self.last_frame[0] * volume).clamp(-1.0, 1.0),
+                    (self.last_frame[1] * volume).clamp(-1.0, 1.0),
+                ];
+                self.resample_phase = 0.0;
+
+                // Only enter pre-buffering again if sender has stopped sending for >40ms
+                let max_empty = ((self.output_sample_rate as usize) / 25).max(1024);
+                if self.empty_run_frames > max_empty {
+                    self.primed = false;
+                }
             }
+        }
+
+        if had_underrun_in_chunk {
+            self.underruns += 1;
         }
     }
 }

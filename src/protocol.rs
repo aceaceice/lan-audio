@@ -8,8 +8,8 @@ pub const AUDIO_MAGIC: [u8; 4] = *b"LANA";
 pub const DISCOVERY_MAGIC: [u8; 8] = *b"LANAUD01";
 pub const PROTOCOL_VERSION: u8 = 1;
 
-/// Default frames per UDP packet (240 frames = 5ms @ 48kHz, 960 bytes stereo i16 PCM)
-pub const DEFAULT_PACKET_FRAMES: usize = 240;
+/// Default frames per UDP packet (120 frames = 2.5ms @ 48kHz, 480 bytes stereo i16 PCM)
+pub const DEFAULT_PACKET_FRAMES: usize = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[repr(u8)]

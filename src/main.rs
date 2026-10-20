@@ -16,10 +16,10 @@ use protocol::{
     Codec, DEFAULT_AUDIO_PORT, DEFAULT_DISCOVERY_PORT, DEFAULT_PACKET_FRAMES,
 };
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -52,7 +52,7 @@ enum Commands {
         discovery_port: u16,
 
         /// Target jitter buffer latency in milliseconds (lower = less delay, higher = smoother over shaky Wi-Fi)
-        #[arg(short, long, default_value_t = 25.0)]
+        #[arg(short, long, default_value_t = 20.0)]
         latency_ms: f32,
 
         /// Playback volume multiplier (1.0 = 100%, 1.5 = 150%)
@@ -142,7 +142,9 @@ fn main() {
             );
             let found = scan_lan_receivers(discovery_port, Duration::from_millis(timeout_ms));
             if found.is_empty() {
-                println!("No receivers found on LAN. Make sure `lan-audio recv` is running on your PC.");
+                println!(
+                    "No receivers found on LAN. Make sure `lan-audio recv` is running on your PC."
+                );
             } else {
                 println!("Found {} receiver(s):", found.len());
                 for r in found {
@@ -175,9 +177,7 @@ fn main() {
             volume,
             discovery_port,
         } => {
-            if let Err(e) =
-                run_sender(target, device, mic, codec, rate, volume, discovery_port)
-            {
+            if let Err(e) = run_sender(target, device, mic, codec, rate, volume, discovery_port) {
                 eprintln!("Error in sender: {}", e);
                 std::process::exit(1);
             }
@@ -193,108 +193,153 @@ fn run_receiver(
     volume: f32,
     custom_name: Option<String>,
 ) -> Result<(), String> {
-    let selected = audio::select_output_device(device_query.as_deref(), Some(48000))?;
-    let output_rate = selected.config.sample_rate.0;
-    let output_channels = selected.config.channels;
     let hostname = custom_name.unwrap_or_else(local_hostname);
     let local_ip = local_lan_ipv4()
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "0.0.0.0".into());
 
+    let running = Arc::new(AtomicBool::new(true));
+    let output_rate: u32 = 48000;
+    let jitter = Arc::new(Mutex::new(JitterBuffer::new(output_rate, latency_ms)));
+    let peak_bits = Arc::new(AtomicU32::new(0));
+
+    // On Linux, use direct low-latency libpulse-simple playback (10ms buffer, 2.5ms chunks)
+    // unless a specific non-pulse ALSA device was requested.
+    let mut _cpal_stream: Option<cpal::Stream> = None;
+    let mut _pulse_thread: Option<thread::JoinHandle<()>> = None;
+    let mut backend_desc = String::new();
+    let mut actual_output_rate = output_rate;
+
+    #[cfg(target_os = "linux")]
+    if device_query.is_none() || device_query.as_deref() == Some("pulse") {
+        let jitter_out = Arc::clone(&jitter);
+        let peak_out = Arc::clone(&peak_bits);
+        if let Ok(handle) = audio::pulse_ffi::spawn_low_latency_playback(
+            None,
+            output_rate,
+            latency_ms,
+            Arc::clone(&running),
+            move |out_stereo| {
+                if let Ok(mut jb) = jitter_out.lock() {
+                    jb.pop_output_frames(out_stereo, volume);
+                } else {
+                    out_stereo.fill([0.0, 0.0]);
+                }
+                let (peak, _) = compute_peak_and_rms(out_stereo);
+                peak_out.store(peak.to_bits(), Ordering::Relaxed);
+            },
+        ) {
+            _pulse_thread = Some(handle);
+            backend_desc = format!("PulseAudio Low-Latency Direct ({} Hz, 2ch, F32)", output_rate);
+        }
+    }
+
+    if _pulse_thread.is_none() {
+        let selected = audio::select_output_device(device_query.as_deref(), Some(48000))?;
+        actual_output_rate = selected.config.sample_rate.0;
+        if let Ok(mut jb) = jitter.lock() {
+            *jb = JitterBuffer::new(actual_output_rate, latency_ms);
+        }
+        backend_desc = format!(
+            "{} ({} Hz, {}ch, {:?})",
+            selected.name, actual_output_rate, selected.config.channels, selected.sample_format
+        );
+        let jitter_out = Arc::clone(&jitter);
+        let peak_out = Arc::clone(&peak_bits);
+        let stream = audio::build_stereo_output_stream(&selected, move |out_stereo| {
+            if let Ok(mut jb) = jitter_out.lock() {
+                jb.pop_output_frames(out_stereo, volume);
+            } else {
+                out_stereo.fill([0.0, 0.0]);
+            }
+            let (peak, _) = compute_peak_and_rms(out_stereo);
+            peak_out.store(peak.to_bits(), Ordering::Relaxed);
+        })?;
+        _cpal_stream = Some(stream);
+    }
+
     println!("============================================================");
     println!(" LAN Audio Receiver ({})", hostname);
     println!("============================================================");
-    println!(
-        "  Output Device : {} ({} Hz, {}ch, {:?})",
-        selected.name, output_rate, output_channels, selected.sample_format
-    );
+    println!("  Output Device : {}", backend_desc);
     println!("  Listening On  : {}:{} (UDP)", local_ip, audio_port);
-    println!("  Discovery     : UDP port {} (Auto-discovery active)", discovery_port);
+    println!(
+        "  Discovery     : UDP port {} (Auto-discovery active)",
+        discovery_port
+    );
     println!("  Target Latency: {:.1} ms", latency_ms);
     println!("============================================================");
     println!("Waiting for audio stream from your laptop (`lan-audio send`)...\n");
 
-    let running = Arc::new(AtomicBool::new(true));
     let _responder = spawn_receiver_responder(
         discovery_port,
         hostname,
         audio_port,
-        output_rate,
+        actual_output_rate,
         2,
         Arc::clone(&running),
     )
     .map_err(|e| format!("Failed to bind discovery port {}: {}", discovery_port, e))?;
 
-    let jitter = Arc::new(Mutex::new(JitterBuffer::new(output_rate, latency_ms)));
-    let peak_bits = Arc::new(AtomicU32::new(0));
-
-    let jitter_out = Arc::clone(&jitter);
-    let peak_out = Arc::clone(&peak_bits);
-
-    let _stream = audio::build_stereo_output_stream(&selected, move |out_stereo| {
-        if let Ok(mut jb) = jitter_out.lock() {
-            jb.pop_output_frames(out_stereo, volume);
-        } else {
-            out_stereo.fill([0.0, 0.0]);
-        }
-        let (peak, _) = compute_peak_and_rms(out_stereo);
-        peak_out.store(peak.to_bits(), Ordering::Relaxed);
-    })?;
-
     let sock = UdpSocket::bind(("0.0.0.0", audio_port))
         .map_err(|e| format!("Failed to bind UDP audio port {}: {}", audio_port, e))?;
-    sock.set_read_timeout(Some(Duration::from_millis(250)))
+
+    let last_sender: Arc<Mutex<Option<(SocketAddr, Codec)>>> = Arc::new(Mutex::new(None));
+    let last_sender_net = Arc::clone(&last_sender);
+    let jitter_net = Arc::clone(&jitter);
+
+    // Dedicated high-priority network receive thread (never blocked by terminal stdout)
+    thread::Builder::new()
+        .name("udp-audio-recv".into())
+        .spawn(move || {
+            let mut packet_buf = [0u8; 4096];
+            let mut decoded_frames = Vec::with_capacity(512);
+            let mut current_src: Option<SocketAddr> = None;
+
+            loop {
+                if let Ok((len, src)) = sock.recv_from(&mut packet_buf) {
+                    if let Some(hdr) = decode_audio_packet(&packet_buf[..len], &mut decoded_frames)
+                    {
+                        if current_src != Some(src) {
+                            current_src = Some(src);
+                            println!(
+                                "\n[+] Connected stream from {} ({}, {} Hz)",
+                                src, hdr.codec, hdr.sample_rate
+                            );
+                            if let Ok(mut ls) = last_sender_net.lock() {
+                                *ls = Some((src, hdr.codec));
+                            }
+                        }
+                        if let Ok(mut jb) = jitter_net.lock() {
+                            jb.push_packet(&hdr, &decoded_frames);
+                        }
+                    }
+                }
+            }
+        })
         .map_err(|e| e.to_string())?;
 
-    let mut packet_buf = [0u8; 4096];
-    let mut decoded_frames = Vec::with_capacity(1024);
-    let mut last_status = Instant::now();
-    let mut last_sender: Option<SocketAddr> = None;
-    let mut last_codec: Option<Codec> = None;
-
+    // Status display loop on main thread
     loop {
-        match sock.recv_from(&mut packet_buf) {
-            Ok((len, src)) => {
-                if let Some(hdr) = decode_audio_packet(&packet_buf[..len], &mut decoded_frames) {
-                    if last_sender != Some(src) {
-                        println!("\n[+] Connected stream from {} ({}, {} Hz)", src, hdr.codec, hdr.sample_rate);
-                        last_sender = Some(src);
-                    }
-                    last_codec = Some(hdr.codec);
-                    if let Ok(mut jb) = jitter.lock() {
-                        jb.push_packet(&hdr, &decoded_frames);
-                    }
-                }
-            }
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => {
-                eprintln!("\n[!] UDP receive error: {}", e);
-            }
-        }
-
-        if last_status.elapsed() >= Duration::from_millis(200) {
-            last_status = Instant::now();
-            if let Some(sender) = last_sender {
-                if let Ok(jb) = jitter.lock() {
-                    let peak = f32::from_bits(peak_bits.load(Ordering::Relaxed));
-                    let vu = format_vu_bar(peak, 20);
-                    let codec_str = last_codec.map(|c| c.to_string()).unwrap_or_else(|| "-".into());
-                    print!(
-                        "\r  Stream: {} | {} {}Hz -> {}Hz | Buf: {:4.1}ms | Pkts: {} (Lost: {}, Underrun: {}) {}   ",
-                        sender.ip(),
-                        codec_str,
-                        jb.sender_sample_rate(),
-                        output_rate,
-                        jb.current_latency_ms(),
-                        jb.packets_received,
-                        jb.packets_lost,
-                        jb.underruns,
-                        vu
-                    );
-                    let _ = std::io::stdout().flush();
-                }
+        thread::sleep(Duration::from_millis(200));
+        let sender_info = last_sender.lock().ok().and_then(|g| *g);
+        if let Some((sender, codec)) = sender_info {
+            if let Ok(jb) = jitter.lock() {
+                let peak = f32::from_bits(peak_bits.load(Ordering::Relaxed));
+                let vu = format_vu_bar(peak, 20);
+                print!(
+                    "\r  Stream: {} | {} {}Hz -> {}Hz | Buf: {:4.1}ms | Pkts: {} (Lost: {}, Underrun: {}) {}   ",
+                    sender.ip(),
+                    codec,
+                    jb.sender_sample_rate(),
+                    actual_output_rate,
+                    jb.current_latency_ms(),
+                    jb.packets_received,
+                    jb.packets_lost,
+                    jb.underruns,
+                    vu
+                );
+                let _ = std::io::stdout().flush();
             }
         }
     }
@@ -349,44 +394,69 @@ fn run_sender(
     let sock = UdpSocket::bind("0.0.0.0:0")
         .map_err(|e| format!("Failed to bind sender UDP socket: {}", e))?;
 
-    // On Linux, if neither `--mic` nor `--device` was specified, prefer PulseAudio/PipeWire desktop monitor if available
+    let packets_sent = Arc::new(AtomicU64::new(0));
+    let bytes_sent = Arc::new(AtomicU64::new(0));
+    let peak_bits = Arc::new(AtomicU32::new(0));
+
+    // Bounded real-time channel so the CoreAudio/PulseAudio callback never waits on network syscalls or mutexes
+    let (audio_tx, audio_rx) = mpsc::sync_channel::<Vec<[f32; 2]>>(64);
+
+    let mut _cpal_stream: Option<cpal::Stream> = None;
+    let mut _pulse_thread: Option<thread::JoinHandle<()>> = None;
+    let mut sample_rate = preferred_rate;
+    let mut input_desc = String::new();
+
     #[cfg(target_os = "linux")]
     if !use_mic && device_query.is_none() {
         if let Some(monitor_source) = audio::linux_default_pulse_monitor() {
-            if Command::new("parecord").arg("--version").output().is_ok() {
-                return run_linux_pulse_monitor_sender(
-                    &monitor_source,
-                    preferred_rate,
-                    codec,
-                    volume,
-                    sock,
-                    static_targets,
-                    receivers,
+            let tx_pulse = audio_tx.clone();
+            if let Ok(handle) = audio::pulse_ffi::spawn_low_latency_capture(
+                &monitor_source,
+                preferred_rate,
+                DEFAULT_PACKET_FRAMES,
+                Arc::clone(&running),
+                move |frames| {
+                    let _ = tx_pulse.try_send(frames.to_vec());
+                },
+            ) {
+                _pulse_thread = Some(handle);
+                input_desc = format!(
+                    "{} (Linux Desktop Audio Monitor, {} Hz, 2ch)",
+                    monitor_source, preferred_rate
                 );
             }
         }
     }
 
-    let selected = audio::select_input_device(
-        device_query.as_deref(),
-        !use_mic,
-        Some(preferred_rate),
-    )?;
-    let sample_rate = selected.config.sample_rate.0;
+    if _pulse_thread.is_none() {
+        let selected = audio::select_input_device(
+            device_query.as_deref(),
+            !use_mic,
+            Some(preferred_rate),
+        )?;
+        sample_rate = selected.config.sample_rate.0;
+        input_desc = format!(
+            "{} ({} Hz, {}ch, {:?})",
+            selected.name, sample_rate, selected.config.channels, selected.sample_format
+        );
+        let tx_cpal = audio_tx;
+        let stream = audio::build_stereo_input_stream(&selected, move |stereo_chunk| {
+            let _ = tx_cpal.try_send(stereo_chunk.to_vec());
+        })?;
+        _cpal_stream = Some(stream);
+    }
 
     println!("============================================================");
     println!(" LAN Audio Sender ({})", local_hostname());
     println!("============================================================");
+    println!("  Input Device : {}", input_desc);
     println!(
-        "  Input Device : {} ({} Hz, {}ch, {:?})",
-        selected.name, sample_rate, selected.config.channels, selected.sample_format
+        "  Codec        : {} ({} frames = {:.1}ms/pkt)",
+        codec,
+        DEFAULT_PACKET_FRAMES,
+        (DEFAULT_PACKET_FRAMES as f32 * 1000.0) / sample_rate as f32
     );
-    println!("  Codec        : {}", codec);
     println!("============================================================");
-
-    let packets_sent = Arc::new(AtomicU64::new(0));
-    let bytes_sent = Arc::new(AtomicU64::new(0));
-    let peak_bits = Arc::new(AtomicU32::new(0));
 
     let packets_cb = Arc::clone(&packets_sent);
     let bytes_cb = Arc::clone(&bytes_sent);
@@ -394,141 +464,46 @@ fn run_sender(
     let receivers_cb = Arc::clone(&receivers);
     let static_targets_cb = static_targets.clone();
 
-    let mut frame_accum: Vec<[f32; 2]> = Vec::with_capacity(DEFAULT_PACKET_FRAMES * 2);
-    let mut packet_buf: Vec<u8> = Vec::with_capacity(1500);
-    let mut adpcm_states = [AdpcmChannelState::default(), AdpcmChannelState::default()];
-    let mut seq: u32 = 0;
+    // Dedicated network packetizer & UDP transmitter thread
+    thread::Builder::new()
+        .name("udp-audio-send".into())
+        .spawn(move || {
+            let mut frame_accum: Vec<[f32; 2]> = Vec::with_capacity(DEFAULT_PACKET_FRAMES * 4);
+            let mut packet_buf: Vec<u8> = Vec::with_capacity(1500);
+            let mut adpcm_states = [AdpcmChannelState::default(), AdpcmChannelState::default()];
+            let mut seq: u32 = 0;
 
-    let _stream = audio::build_stereo_input_stream(&selected, move |stereo_chunk| {
-        let (peak, _) = compute_peak_and_rms(stereo_chunk);
-        peak_cb.store((peak * volume).to_bits(), Ordering::Relaxed);
+            while let Ok(chunk) = audio_rx.recv() {
+                let (peak, _) = compute_peak_and_rms(&chunk);
+                peak_cb.store((peak * volume).to_bits(), Ordering::Relaxed);
 
-        for &[l, r] in stereo_chunk {
-            frame_accum.push([l * volume, r * volume]);
-            if frame_accum.len() >= DEFAULT_PACKET_FRAMES {
-                encode_audio_packet(
-                    codec,
-                    seq,
-                    sample_rate,
-                    &frame_accum[..DEFAULT_PACKET_FRAMES],
-                    &mut adpcm_states,
-                    &mut packet_buf,
-                );
-                seq = seq.wrapping_add(1);
-                frame_accum.clear();
+                for &[l, r] in &chunk {
+                    frame_accum.push([l * volume, r * volume]);
+                    if frame_accum.len() >= DEFAULT_PACKET_FRAMES {
+                        encode_audio_packet(
+                            codec,
+                            seq,
+                            sample_rate,
+                            &frame_accum[..DEFAULT_PACKET_FRAMES],
+                            &mut adpcm_states,
+                            &mut packet_buf,
+                        );
+                        seq = seq.wrapping_add(1);
+                        frame_accum.clear();
 
-                send_packet_to_targets(
-                    &sock,
-                    &packet_buf,
-                    &static_targets_cb,
-                    &receivers_cb,
-                    &packets_cb,
-                    &bytes_cb,
-                );
+                        send_packet_to_targets(
+                            &sock,
+                            &packet_buf,
+                            &static_targets_cb,
+                            &receivers_cb,
+                            &packets_cb,
+                            &bytes_cb,
+                        );
+                    }
+                }
             }
-        }
-    })?;
-
-    print_sender_status_loop(codec, sample_rate, &packets_sent, &bytes_sent, &peak_bits, &static_targets, &receivers)
-}
-
-#[cfg(target_os = "linux")]
-fn run_linux_pulse_monitor_sender(
-    monitor_source: &str,
-    sample_rate: u32,
-    codec: Codec,
-    volume: f32,
-    sock: UdpSocket,
-    static_targets: Vec<SocketAddr>,
-    receivers: Arc<Mutex<HashMap<SocketAddr, DiscoveredReceiver>>>,
-) -> Result<(), String> {
-    println!("============================================================");
-    println!(" LAN Audio Sender ({})", local_hostname());
-    println!("============================================================");
-    println!(
-        "  Input Source : {} (Linux Desktop Audio Monitor, {} Hz, 2ch)",
-        monitor_source, sample_rate
-    );
-    println!("  Codec        : {}", codec);
-    println!("============================================================");
-
-    let mut child = Command::new("parecord")
-        .args([
-            "--raw",
-            "--format=float32le",
-            &format!("--rate={}", sample_rate),
-            "--channels=2",
-            "--latency-msec=5",
-            "-d",
-            monitor_source,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Failed to spawn parecord for desktop audio capture: {}", e))?;
-
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Failed to open parecord stdout".to_string())?;
-
-    let packets_sent = Arc::new(AtomicU64::new(0));
-    let bytes_sent = Arc::new(AtomicU64::new(0));
-    let peak_bits = Arc::new(AtomicU32::new(0));
-
-    let packets_cb = Arc::clone(&packets_sent);
-    let bytes_cb = Arc::clone(&bytes_sent);
-    let peak_cb = Arc::clone(&peak_bits);
-    let receivers_cb = Arc::clone(&receivers);
-    let static_targets_cb = static_targets.clone();
-
-    thread::spawn(move || {
-        let mut raw_bytes = vec![0u8; DEFAULT_PACKET_FRAMES * 8];
-        let mut frames = vec![[0.0f32; 2]; DEFAULT_PACKET_FRAMES];
-        let mut packet_buf = Vec::with_capacity(1500);
-        let mut adpcm_states = [AdpcmChannelState::default(), AdpcmChannelState::default()];
-        let mut seq: u32 = 0;
-
-        while stdout.read_exact(&mut raw_bytes).is_ok() {
-            for i in 0..DEFAULT_PACKET_FRAMES {
-                let b = i * 8;
-                let l = f32::from_le_bytes([
-                    raw_bytes[b],
-                    raw_bytes[b + 1],
-                    raw_bytes[b + 2],
-                    raw_bytes[b + 3],
-                ]) * volume;
-                let r = f32::from_le_bytes([
-                    raw_bytes[b + 4],
-                    raw_bytes[b + 5],
-                    raw_bytes[b + 6],
-                    raw_bytes[b + 7],
-                ]) * volume;
-                frames[i] = [l, r];
-            }
-            let (peak, _) = compute_peak_and_rms(&frames);
-            peak_cb.store(peak.to_bits(), Ordering::Relaxed);
-
-            encode_audio_packet(
-                codec,
-                seq,
-                sample_rate,
-                &frames,
-                &mut adpcm_states,
-                &mut packet_buf,
-            );
-            seq = seq.wrapping_add(1);
-
-            send_packet_to_targets(
-                &sock,
-                &packet_buf,
-                &static_targets_cb,
-                &receivers_cb,
-                &packets_cb,
-                &bytes_cb,
-            );
-        }
-    });
+        })
+        .map_err(|e| e.to_string())?;
 
     print_sender_status_loop(
         codec,
