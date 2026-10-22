@@ -1,13 +1,15 @@
 [package]
 name = "lan-audio"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Ultra-low-latency LAN audio streaming between macOS and Linux devices with automatic discovery"
+description = "Ultra-low-latency LAN audio streaming between macOS and Linux devices with automatic discovery and Gruvbox GUI"
 license = "MIT"
 
 [dependencies]
 cpal = "0.15"
 clap = { version = "4.5", features = ["derive"] }
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+ctrlc = { version = "3.4", features = ["termination"] }
 
 [profile.release]
 opt-level = 3

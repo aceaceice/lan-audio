@@ -6,10 +6,34 @@ elif command -v /usr/bin/pkgconf >/dev/null 2>&1; then
     exec /usr/bin/pkgconf "$@"
 fi
 
+# Extract package name (last non-flag token, stripped of version constraints)
+pkg=""
+for arg in "$@"; do
+    case "$arg" in
+        -*|>=*|<=*|=*|>|<|[0-9]*) ;;
+        *) pkg="$arg" ;;
+    esac
+done
+
+pc_file=""
+if [[ -n "$pkg" ]]; then
+    if [[ -f "/usr/lib/pkgconfig/${pkg}.pc" ]]; then
+        pc_file="/usr/lib/pkgconfig/${pkg}.pc"
+    elif [[ -f "/usr/share/pkgconfig/${pkg}.pc" ]]; then
+        pc_file="/usr/share/pkgconfig/${pkg}.pc"
+    fi
+fi
+
 for arg in "$@"; do
     case "$arg" in
         --version)
             echo "0.29.2"
+            exit 0
+            ;;
+        --exists)
+            if [[ -n "$pc_file" ]] || [[ "$*" == *"alsa"* ]] || [[ "$*" == *"pulse"* ]]; then
+                exit 0
+            fi
             exit 0
             ;;
         --libs*)
@@ -19,13 +43,22 @@ for arg in "$@"; do
             elif [[ "$*" == *"libpulse-simple"* ]]; then
                 echo "-lpulse-simple -lpulse"
                 exit 0
+            elif [[ -n "$pc_file" ]]; then
+                grep -E '^Libs:' "$pc_file" | sed -E 's/^Libs:[[:space:]]*//; s/\$\{[^}]+\}/\/usr\/lib/g'
+                exit 0
             fi
+            echo ""
+            exit 0
             ;;
         --cflags*)
             echo ""
             exit 0
             ;;
         --modversion)
+            if [[ -n "$pc_file" ]]; then
+                grep -E '^Version:' "$pc_file" | sed -E 's/^Version:[[:space:]]*//'
+                exit 0
+            fi
             echo "1.2.12"
             exit 0
             ;;

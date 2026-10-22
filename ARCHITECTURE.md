@@ -79,7 +79,22 @@ Every UDP packet has a **24-byte header** (`AudioHeader`) followed by `120` ster
 
 ---
 
-## 4. Roadmap / Future Convenience Features
+## 4. Gruvbox GUI, Ricing Engine & macOS Auto-Routing (`src/gui.rs`, `src/theme.rs`, `src/audio.rs`)
+
+1. **Waybar / GTK `@define-color` Ricing Engine (`src/theme.rs`)**:
+   - Auto-generates `~/.config/lan-audio/style.css` with the Gruvbox palette (`@black`, `@bg2`, `@braqua`, `@brpurple`, `@bryellow`, etc.) and semantic roles (`@sound`, `@network`, `@focused`, `@unfocused`, `@warning`, `@critical`, `@memory`, `@temp`, `@layout`, `@date`, `@time`) on first launch.
+   - Polls `mtime` every `500 ms` and **hot-reloads live** whenever `~/.config/lan-audio/style.css` is saved (compatible with dotfile theme switchers, `pywal`, `matugen`, `wallust`, or manual edits).
+   - Also supports geometry variables (`border-radius`, `border-width`, `font-scale`).
+2. **macOS CoreAudio Automatic Output Switcher (`MacOutputGuard` in `src/audio.rs`)**:
+   - Uses `AudioObjectGetPropertyData` / `AudioObjectSetPropertyData` (`kAudioHardwarePropertyDefaultOutputDevice`) directly via `CoreAudio.framework` FFI—requiring **zero macOS TCC Screen/Audio Recording permissions**.
+   - Supports 4 modes (`Auto`, `MultiOutput` [PC + Mac], `PcOnly` [BlackHole, muting Mac speakers], `Manual`).
+   - Saves the original output device ID (e.g., *MacBook Pro Speakers*) and automatically restores it when clicking **STOP**, closing the GUI window, or pressing **`Ctrl+C`** in CLI mode.
+3. **Standalone macOS `.app` Bundle (`scripts/bundle-macos-app.sh`)**:
+   - Packages the release binary into `target/release/LAN Audio.app` so it can be launched from `/Applications`, Spotlight, or the Dock without opening Terminal.
+
+---
+
+## 5. Roadmap / Future Convenience Features
 
 - **Native macOS `ScreenCaptureKit` Capture**: Capture macOS desktop system audio directly on macOS 13+ without requiring `BlackHole 2ch` or Audio MIDI Setup.
 - **Interactive TUI / System Tray App**: Toggle receivers, adjust per-device volume, mute/unmute, and switch audio devices live.

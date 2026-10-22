@@ -18,6 +18,243 @@ const MACOS_LOOPBACK_KEYWORDS: &[&str] = &[
     "multi-output",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MacRouteMode {
+    /// Automatically switch Mac output to Multi-Output Device (or BlackHole) on start and restore on stop
+    Auto,
+    /// Switch Mac output to Multi-Output Device (play on both PC & Mac speakers) and restore on stop
+    MultiOutput,
+    /// Switch Mac output to BlackHole 2ch (play on PC only, mute Mac speakers) and restore on stop
+    PcOnly,
+    /// Do not automatically switch macOS output device
+    Manual,
+}
+
+impl MacRouteMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Auto => "AUTO (MULTI/BH)",
+            Self::MultiOutput => "PC + MAC (MULTI)",
+            Self::PcOnly => "PC ONLY (MUTE MAC)",
+            Self::Manual => "MANUAL",
+        }
+    }
+}
+
+/// RAII guard that restores the user's previous macOS default output device (e.g. MacBook Speakers) on drop/stop
+pub struct MacOutputGuard {
+    #[cfg(target_os = "macos")]
+    original_device_id: Option<u32>,
+    pub original_name: Option<String>,
+    pub active_name: Option<String>,
+}
+
+impl MacOutputGuard {
+    pub fn activate(mode: MacRouteMode) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            if mode != MacRouteMode::Manual {
+                if let Some((orig_id, orig_name, target_id, target_name)) =
+                    macos_coreaudio::switch_output_for_mode(mode)
+                {
+                    if orig_id != target_id {
+                        println!(
+                            "[+] macOS Auto-Route: '{}' -> '{}' (will restore on stop)",
+                            orig_name, target_name
+                        );
+                        return Self {
+                            original_device_id: Some(orig_id),
+                            original_name: Some(orig_name),
+                            active_name: Some(target_name),
+                        };
+                    } else {
+                        return Self {
+                            original_device_id: None,
+                            original_name: Some(orig_name),
+                            active_name: Some(target_name),
+                        };
+                    }
+                }
+            }
+        }
+        let _ = mode;
+        Self {
+            #[cfg(target_os = "macos")]
+            original_device_id: None,
+            original_name: None,
+            active_name: None,
+        }
+    }
+
+    pub fn restore(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(orig_id) = self.original_device_id.take() {
+            macos_coreaudio::set_default_output_device(orig_id);
+            if let Some(ref name) = self.original_name {
+                println!("\n[+] macOS Auto-Route: Restored output to '{}'", name);
+            }
+        }
+    }
+}
+
+impl Drop for MacOutputGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos_coreaudio {
+    use super::MacRouteMode;
+    use cpal::traits::{DeviceTrait, HostTrait};
+    use std::mem;
+    use std::ptr;
+
+    const K_AUDIO_OBJECT_SYSTEM_OBJECT: u32 = 1;
+    const K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE: u32 = 0x644F_7574; // 'dOut'
+    const K_AUDIO_HARDWARE_PROPERTY_DEFAULT_SYSTEM_OUTPUT_DEVICE: u32 = 0x734F_7574; // 'sOut'
+    const K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL: u32 = 0x676C_6F62; // 'glob'
+    const K_AUDIO_OBJECT_PROPERTY_ELEMENT_MASTER: u32 = 0;
+
+    #[repr(C)]
+    struct AudioObjectPropertyAddress {
+        m_selector: u32,
+        m_scope: u32,
+        m_element: u32,
+    }
+
+    #[link(name = "CoreAudio", kind = "framework")]
+    extern "C" {
+        fn AudioObjectGetPropertyData(
+            in_object_id: u32,
+            in_address: *const AudioObjectPropertyAddress,
+            in_qualifier_data_size: u32,
+            in_qualifier_data: *const std::ffi::c_void,
+            io_data_size: *mut u32,
+            out_data: *mut std::ffi::c_void,
+        ) -> i32;
+
+        fn AudioObjectSetPropertyData(
+            in_object_id: u32,
+            in_address: *const AudioObjectPropertyAddress,
+            in_qualifier_data_size: u32,
+            in_qualifier_data: *const std::ffi::c_void,
+            in_data_size: u32,
+            in_data: *const std::ffi::c_void,
+        ) -> i32;
+    }
+
+    pub fn get_default_output_device() -> Option<u32> {
+        let addr = AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MASTER,
+        };
+        let mut dev_id: u32 = 0;
+        let mut size = mem::size_of::<u32>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                K_AUDIO_OBJECT_SYSTEM_OBJECT,
+                &addr,
+                0,
+                ptr::null(),
+                &mut size,
+                &mut dev_id as *mut u32 as *mut _,
+            )
+        };
+        if status == 0 && dev_id != 0 {
+            Some(dev_id)
+        } else {
+            None
+        }
+    }
+
+    pub fn set_default_output_device(dev_id: u32) -> bool {
+        let size = mem::size_of::<u32>() as u32;
+        let addr_out = AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MASTER,
+        };
+        let addr_sys = AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_HARDWARE_PROPERTY_DEFAULT_SYSTEM_OUTPUT_DEVICE,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MASTER,
+        };
+        unsafe {
+            let s1 = AudioObjectSetPropertyData(
+                K_AUDIO_OBJECT_SYSTEM_OBJECT,
+                &addr_out,
+                0,
+                ptr::null(),
+                size,
+                &dev_id as *const u32 as *const _,
+            );
+            let _ = AudioObjectSetPropertyData(
+                K_AUDIO_OBJECT_SYSTEM_OBJECT,
+                &addr_sys,
+                0,
+                ptr::null(),
+                size,
+                &dev_id as *const u32 as *const _,
+            );
+            s1 == 0
+        }
+    }
+
+    fn extract_device_id(dev: &cpal::Device) -> Option<u32> {
+        // cpal::Device Debug format on macOS: `Device { audio_device_id: 73, name: Ok("...") }`
+        let dbg = format!("{:?}", dev);
+        let marker = "audio_device_id:";
+        let idx = dbg.find(marker)?;
+        let rest = dbg[idx + marker.len()..].trim_start();
+        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        num_str.parse::<u32>().ok()
+    }
+
+    pub fn switch_output_for_mode(mode: MacRouteMode) -> Option<(u32, String, u32, String)> {
+        let host = cpal::default_host();
+        let orig_id = get_default_output_device()?;
+        let orig_name = host
+            .default_output_device()
+            .and_then(|d| d.name().ok())
+            .unwrap_or_else(|| format!("Device #{}", orig_id));
+
+        let mut multi_dev: Option<(u32, String)> = None;
+        let mut bh_dev: Option<(u32, String)> = None;
+
+        if let Ok(devs) = host.output_devices() {
+            for d in devs {
+                let name = d.name().unwrap_or_default();
+                let lower = name.to_lowercase();
+                if let Some(id) = extract_device_id(&d) {
+                    if lower.contains("multi-output") || lower.contains("aggregate") {
+                        multi_dev = Some((id, name));
+                    } else if lower.contains("blackhole")
+                        || lower.contains("loopback")
+                        || lower.contains("soundflower")
+                    {
+                        bh_dev = Some((id, name));
+                    }
+                }
+            }
+        }
+
+        let target = match mode {
+            MacRouteMode::Auto | MacRouteMode::MultiOutput => multi_dev.or(bh_dev),
+            MacRouteMode::PcOnly => bh_dev.or(multi_dev),
+            MacRouteMode::Manual => None,
+        }?;
+
+        if target.0 != orig_id {
+            if !set_default_output_device(target.0) {
+                return None;
+            }
+        }
+        Some((orig_id, orig_name, target.0, target.1))
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub mod pulse_ffi {
     use std::ffi::{c_char, c_int, c_void, CString};
@@ -744,4 +981,37 @@ where
         }
         _ => Err(cpal::BuildStreamError::StreamConfigNotSupported),
     }
+}
+
+pub fn list_device_names(is_input: bool) -> Vec<String> {
+    let mut out = vec!["Default (Auto)".to_string()];
+    let host = cpal::default_host();
+    if is_input {
+        #[cfg(target_os = "linux")]
+        if let Some(mon) = linux_default_pulse_monitor() {
+            out.push(format!("PulseMonitor: {}", mon));
+        }
+        if let Ok(devs) = host.input_devices() {
+            for d in devs {
+                if let Ok(n) = d.name() {
+                    if !out.contains(&n) {
+                        out.push(n);
+                    }
+                }
+            }
+        }
+    } else {
+        #[cfg(target_os = "linux")]
+        out.push("pulse (Low-Latency Direct)".to_string());
+        if let Ok(devs) = host.output_devices() {
+            for d in devs {
+                if let Ok(n) = d.name() {
+                    if !out.contains(&n) {
+                        out.push(n);
+                    }
+                }
+            }
+        }
+    }
+    out
 }

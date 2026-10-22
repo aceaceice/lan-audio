@@ -1,8 +1,11 @@
 mod audio;
 mod discovery;
 mod dsp;
+mod gui;
 mod protocol;
+mod theme;
 
+use audio::{MacOutputGuard, MacRouteMode};
 use clap::{Parser, Subcommand};
 use discovery::{
     local_hostname, local_lan_ipv4, scan_lan_receivers, spawn_receiver_responder,
@@ -18,6 +21,7 @@ use protocol::{
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -32,11 +36,22 @@ use std::time::{Duration, Instant};
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Launch the minimalist Gruvbox GUI control panel (default when run with no arguments)
+    Gui {
+        /// Start GUI in Receiver mode instead of Sender mode
+        #[arg(long)]
+        recv: bool,
+
+        /// Custom path to a Waybar/GTK `@define-color` CSS theme file (defaults to `~/.config/lan-audio/style.css`)
+        #[arg(short, long)]
+        style: Option<PathBuf>,
+    },
+
     /// Receive audio over LAN and play it on this computer's speakers/headphones
     Recv {
         /// Output audio device name or index (see `lan-audio devices`)
@@ -100,6 +115,10 @@ enum Commands {
         #[arg(long)]
         no_silence_pause: bool,
 
+        /// macOS output routing mode: `auto` switches to Multi-Output/BlackHole on start and restores speakers on Ctrl+C
+        #[arg(long, value_enum, default_value_t = MacRouteMode::Auto)]
+        route: MacRouteMode,
+
         /// UDP port used for automatic LAN discovery
         #[arg(long, default_value_t = DEFAULT_DISCOVERY_PORT)]
         discovery_port: u16,
@@ -120,7 +139,7 @@ enum Commands {
     Devices,
 }
 
-fn parse_target_addr(raw: &str) -> Result<SocketAddr, String> {
+pub(crate) fn parse_target_addr(raw: &str) -> Result<SocketAddr, String> {
     let with_port = if raw.contains(':') {
         raw.to_string()
     } else {
@@ -137,13 +156,35 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Devices => {
+        None => {
+            let default_mode = if cfg!(target_os = "macos") {
+                gui::GuiMode::Send
+            } else {
+                gui::GuiMode::Recv
+            };
+            if let Err(e) = gui::run_gui(default_mode, None) {
+                eprintln!("Error in GUI: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Gui { recv, style }) => {
+            let mode = if recv {
+                gui::GuiMode::Recv
+            } else {
+                gui::GuiMode::Send
+            };
+            if let Err(e) = gui::run_gui(mode, style) {
+                eprintln!("Error in GUI: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Devices) => {
             audio::list_devices();
         }
-        Commands::Discover {
+        Some(Commands::Discover {
             discovery_port,
             timeout_ms,
-        } => {
+        }) => {
             println!(
                 "Scanning LAN (port {}) for active receivers...",
                 discovery_port
@@ -163,7 +204,7 @@ fn main() {
                 }
             }
         }
-        Commands::Recv {
+        Some(Commands::Recv {
             device,
             port,
             discovery_port,
@@ -171,7 +212,7 @@ fn main() {
             max_latency_ms,
             volume,
             name,
-        } => {
+        }) => {
             if let Err(e) = run_receiver(
                 device,
                 port,
@@ -185,7 +226,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Send {
+        Some(Commands::Send {
             target,
             device,
             mic,
@@ -193,8 +234,9 @@ fn main() {
             rate,
             volume,
             no_silence_pause,
+            route,
             discovery_port,
-        } => {
+        }) => {
             if let Err(e) = run_sender(
                 target,
                 device,
@@ -203,6 +245,7 @@ fn main() {
                 rate,
                 volume,
                 !no_silence_pause,
+                route,
                 discovery_port,
             ) {
                 eprintln!("Error in sender: {}", e);
@@ -398,9 +441,27 @@ fn run_sender(
     preferred_rate: u32,
     volume: f32,
     silence_pause: bool,
+    mac_route: MacRouteMode,
     discovery_port: u16,
 ) -> Result<(), String> {
     let running = Arc::new(AtomicBool::new(true));
+    let mac_guard = Arc::new(Mutex::new(MacOutputGuard::activate(if use_mic {
+        MacRouteMode::Manual
+    } else {
+        mac_route
+    })));
+    {
+        let running_sig = Arc::clone(&running);
+        let guard_sig = Arc::clone(&mac_guard);
+        let _ = ctrlc::set_handler(move || {
+            running_sig.store(false, Ordering::Relaxed);
+            if let Ok(mut g) = guard_sig.lock() {
+                g.restore();
+            }
+            std::process::exit(0);
+        });
+    }
+
     let receivers: Arc<Mutex<HashMap<SocketAddr, DiscoveredReceiver>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
@@ -613,7 +674,7 @@ fn run_sender(
     )
 }
 
-fn send_packet_to_targets(
+pub(crate) fn send_packet_to_targets(
     sock: &UdpSocket,
     packet_buf: &[u8],
     static_targets: &[SocketAddr],
