@@ -13,7 +13,7 @@ use dsp::{
     AdpcmChannelState, JitterBuffer,
 };
 use protocol::{
-    Codec, DEFAULT_AUDIO_PORT, DEFAULT_DISCOVERY_PORT, DEFAULT_PACKET_FRAMES,
+    Codec, DEFAULT_AUDIO_PORT, DEFAULT_DISCOVERY_PORT, DEFAULT_PACKET_FRAMES, FLAG_STREAM_RESUMED,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -55,6 +55,10 @@ enum Commands {
         #[arg(short, long, default_value_t = 20.0)]
         latency_ms: f32,
 
+        /// Maximum jitter buffer cap in milliseconds before trimming bursts (defaults to ~2.25x target latency)
+        #[arg(long)]
+        max_latency_ms: Option<f32>,
+
         /// Playback volume multiplier (1.0 = 100%, 1.5 = 150%)
         #[arg(short, long, default_value_t = 1.0)]
         volume: f32,
@@ -91,6 +95,10 @@ enum Commands {
         /// Digital gain / volume multiplier applied before sending (1.0 = 100%)
         #[arg(short, long, default_value_t = 1.0)]
         volume: f32,
+
+        /// Disable automatic silence pause (DTX) and stream silent packets continuously even when no audio is playing
+        #[arg(long)]
+        no_silence_pause: bool,
 
         /// UDP port used for automatic LAN discovery
         #[arg(long, default_value_t = DEFAULT_DISCOVERY_PORT)]
@@ -160,10 +168,19 @@ fn main() {
             port,
             discovery_port,
             latency_ms,
+            max_latency_ms,
             volume,
             name,
         } => {
-            if let Err(e) = run_receiver(device, port, discovery_port, latency_ms, volume, name) {
+            if let Err(e) = run_receiver(
+                device,
+                port,
+                discovery_port,
+                latency_ms,
+                max_latency_ms,
+                volume,
+                name,
+            ) {
                 eprintln!("Error in receiver: {}", e);
                 std::process::exit(1);
             }
@@ -175,9 +192,19 @@ fn main() {
             codec,
             rate,
             volume,
+            no_silence_pause,
             discovery_port,
         } => {
-            if let Err(e) = run_sender(target, device, mic, codec, rate, volume, discovery_port) {
+            if let Err(e) = run_sender(
+                target,
+                device,
+                mic,
+                codec,
+                rate,
+                volume,
+                !no_silence_pause,
+                discovery_port,
+            ) {
                 eprintln!("Error in sender: {}", e);
                 std::process::exit(1);
             }
@@ -190,6 +217,7 @@ fn run_receiver(
     audio_port: u16,
     discovery_port: u16,
     latency_ms: f32,
+    max_latency_ms: Option<f32>,
     volume: f32,
     custom_name: Option<String>,
 ) -> Result<(), String> {
@@ -200,7 +228,11 @@ fn run_receiver(
 
     let running = Arc::new(AtomicBool::new(true));
     let output_rate: u32 = 48000;
-    let jitter = Arc::new(Mutex::new(JitterBuffer::new(output_rate, latency_ms)));
+    let jitter = Arc::new(Mutex::new(JitterBuffer::new(
+        output_rate,
+        latency_ms,
+        max_latency_ms,
+    )));
     let peak_bits = Arc::new(AtomicU32::new(0));
 
     // On Linux, use direct low-latency libpulse-simple playback (10ms buffer, 2.5ms chunks)
@@ -238,7 +270,7 @@ fn run_receiver(
         let selected = audio::select_output_device(device_query.as_deref(), Some(48000))?;
         actual_output_rate = selected.config.sample_rate.0;
         if let Ok(mut jb) = jitter.lock() {
-            *jb = JitterBuffer::new(actual_output_rate, latency_ms);
+            *jb = JitterBuffer::new(actual_output_rate, latency_ms, max_latency_ms);
         }
         backend_desc = format!(
             "{} ({} Hz, {}ch, {:?})",
@@ -258,6 +290,11 @@ fn run_receiver(
         _cpal_stream = Some(stream);
     }
 
+    let effective_max_ms = jitter
+        .lock()
+        .map(|jb| jb.max_latency_ms())
+        .unwrap_or(latency_ms * 2.25);
+
     println!("============================================================");
     println!(" LAN Audio Receiver ({})", hostname);
     println!("============================================================");
@@ -267,7 +304,10 @@ fn run_receiver(
         "  Discovery     : UDP port {} (Auto-discovery active)",
         discovery_port
     );
-    println!("  Target Latency: {:.1} ms", latency_ms);
+    println!(
+        "  Target Latency: {:.1} ms (Max Cap: {:.1} ms)",
+        latency_ms, effective_max_ms
+    );
     println!("============================================================");
     println!("Waiting for audio stream from your laptop (`lan-audio send`)...\n");
 
@@ -327,13 +367,18 @@ fn run_receiver(
             if let Ok(jb) = jitter.lock() {
                 let peak = f32::from_bits(peak_bits.load(Ordering::Relaxed));
                 let vu = format_vu_bar(peak, 20);
+                let buf_str = if jb.is_active() {
+                    format!("{:4.1}ms", jb.current_latency_ms())
+                } else {
+                    "Idle  ".to_string()
+                };
                 print!(
-                    "\r  Stream: {} | {} {}Hz -> {}Hz | Buf: {:4.1}ms | Pkts: {} (Lost: {}, Underrun: {}) {}   ",
+                    "\r  Stream: {} | {} {}Hz -> {}Hz | Buf: {} | Pkts: {} (Lost: {}, Underrun: {}) {}   ",
                     sender.ip(),
                     codec,
                     jb.sender_sample_rate(),
                     actual_output_rate,
-                    jb.current_latency_ms(),
+                    buf_str,
                     jb.packets_received,
                     jb.packets_lost,
                     jb.underruns,
@@ -352,6 +397,7 @@ fn run_sender(
     codec: Codec,
     preferred_rate: u32,
     volume: f32,
+    silence_pause: bool,
     discovery_port: u16,
 ) -> Result<(), String> {
     let running = Arc::new(AtomicBool::new(true));
@@ -397,6 +443,7 @@ fn run_sender(
     let packets_sent = Arc::new(AtomicU64::new(0));
     let bytes_sent = Arc::new(AtomicU64::new(0));
     let peak_bits = Arc::new(AtomicU32::new(0));
+    let stream_paused = Arc::new(AtomicBool::new(false));
 
     // Bounded real-time channel so the CoreAudio/PulseAudio callback never waits on network syscalls or mutexes
     let (audio_tx, audio_rx) = mpsc::sync_channel::<Vec<[f32; 2]>>(64);
@@ -456,11 +503,20 @@ fn run_sender(
         DEFAULT_PACKET_FRAMES,
         (DEFAULT_PACKET_FRAMES as f32 * 1000.0) / sample_rate as f32
     );
+    println!(
+        "  Silence Pause: {}",
+        if silence_pause {
+            "Enabled (pauses UDP after 500ms of silence, 0ms instant resume)"
+        } else {
+            "Disabled (streaming continuously)"
+        }
+    );
     println!("============================================================");
 
     let packets_cb = Arc::clone(&packets_sent);
     let bytes_cb = Arc::clone(&bytes_sent);
     let peak_cb = Arc::clone(&peak_bits);
+    let paused_cb = Arc::clone(&stream_paused);
     let receivers_cb = Arc::clone(&receivers);
     let static_targets_cb = static_targets.clone();
 
@@ -473,6 +529,12 @@ fn run_sender(
             let mut adpcm_states = [AdpcmChannelState::default(), AdpcmChannelState::default()];
             let mut seq: u32 = 0;
 
+            // Silence suppression (DTX): ~ -82 dBFS threshold, 500ms hangover tail
+            const SILENCE_THRESHOLD: f32 = 0.00008;
+            let hangover_packets = ((sample_rate as usize / DEFAULT_PACKET_FRAMES) / 2).max(40);
+            let mut silent_packets_run: usize = 0;
+            let mut is_paused = false;
+
             while let Ok(chunk) = audio_rx.recv() {
                 let (peak, _) = compute_peak_and_rms(&chunk);
                 peak_cb.store((peak * volume).to_bits(), Ordering::Relaxed);
@@ -480,10 +542,44 @@ fn run_sender(
                 for &[l, r] in &chunk {
                     frame_accum.push([l * volume, r * volume]);
                     if frame_accum.len() >= DEFAULT_PACKET_FRAMES {
+                        let pkt_slice = &mut frame_accum[..DEFAULT_PACKET_FRAMES];
+                        let (pkt_peak, _) = compute_peak_and_rms(pkt_slice);
+
+                        let mut flags = 0u8;
+                        if silence_pause {
+                            if pkt_peak <= SILENCE_THRESHOLD {
+                                silent_packets_run = silent_packets_run.saturating_add(1);
+                                if silent_packets_run == hangover_packets {
+                                    // Smoothly fade the final tail packet to exact 0.0 before pausing
+                                    let len = pkt_slice.len();
+                                    for (i, frame) in pkt_slice.iter_mut().enumerate() {
+                                        let atten = 1.0 - (i as f32 / len as f32);
+                                        frame[0] *= atten;
+                                        frame[1] *= atten;
+                                    }
+                                } else if silent_packets_run > hangover_packets {
+                                    if !is_paused {
+                                        is_paused = true;
+                                        paused_cb.store(true, Ordering::Relaxed);
+                                    }
+                                    frame_accum.clear();
+                                    continue;
+                                }
+                            } else {
+                                if is_paused {
+                                    is_paused = false;
+                                    paused_cb.store(false, Ordering::Relaxed);
+                                    flags |= FLAG_STREAM_RESUMED;
+                                }
+                                silent_packets_run = 0;
+                            }
+                        }
+
                         encode_audio_packet(
                             codec,
                             seq,
                             sample_rate,
+                            flags,
                             &frame_accum[..DEFAULT_PACKET_FRAMES],
                             &mut adpcm_states,
                             &mut packet_buf,
@@ -511,6 +607,7 @@ fn run_sender(
         &packets_sent,
         &bytes_sent,
         &peak_bits,
+        &stream_paused,
         &static_targets,
         &receivers,
     )
@@ -547,6 +644,7 @@ fn print_sender_status_loop(
     packets_sent: &AtomicU64,
     bytes_sent: &AtomicU64,
     peak_bits: &AtomicU32,
+    stream_paused: &AtomicBool,
     static_targets: &[SocketAddr],
     receivers: &Arc<Mutex<HashMap<SocketAddr, DiscoveredReceiver>>>,
 ) -> Result<(), String> {
@@ -565,6 +663,7 @@ fn print_sender_status_loop(
         let pkts = packets_sent.load(Ordering::Relaxed);
         let peak = f32::from_bits(peak_bits.load(Ordering::Relaxed));
         let vu = format_vu_bar(peak, 20);
+        let paused = stream_paused.load(Ordering::Relaxed);
 
         let target_count = if !static_targets.is_empty() {
             static_targets.len()
@@ -572,9 +671,15 @@ fn print_sender_status_loop(
             receivers.lock().map(|m| m.len()).unwrap_or(0)
         };
 
+        let rate_str = if paused {
+            "   0.0 kbps (Silent)".to_string()
+        } else {
+            format!("{:6.1} kbps        ", kbps)
+        };
+
         print!(
-            "\r  Receivers: {} | {} {}Hz | {:6.1} kbps | Pkts: {} {}   ",
-            target_count, codec, sample_rate, kbps, pkts, vu
+            "\r  Receivers: {} | {} {}Hz | {} | Pkts: {} {}   ",
+            target_count, codec, sample_rate, rate_str, pkts, vu
         );
         let _ = std::io::stdout().flush();
     }

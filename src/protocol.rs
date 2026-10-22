@@ -8,6 +8,9 @@ pub const AUDIO_MAGIC: [u8; 4] = *b"LANA";
 pub const DISCOVERY_MAGIC: [u8; 8] = *b"LANAUD01";
 pub const PROTOCOL_VERSION: u8 = 1;
 
+/// Header flag set on the first packet when resuming after a silence (DTX) pause
+pub const FLAG_STREAM_RESUMED: u8 = 0x01;
+
 /// Default frames per UDP packet (120 frames = 2.5ms @ 48kHz, 480 bytes stereo i16 PCM)
 pub const DEFAULT_PACKET_FRAMES: usize = 120;
 

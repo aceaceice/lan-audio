@@ -5,7 +5,8 @@ Ultra-low-latency LAN audio streamer in Rust (`cpal` + UDP) for streaming sound 
 ## Features
 - **Zero-config LAN Discovery**: Receivers announce themselves via UDP broadcast & multicast (`54320`). Senders automatically find all receivers on your LAN without typing IP addresses.
 - **Multi-Device / 1-to-Many Streaming**: Stream audio from your laptop to one or multiple Linux PCs simultaneously.
-- **Adaptive Jitter Buffer & Fractional Resampler**: Automatically converts between macOS (`48000 Hz`) and Linux hardware sample rates (`44100 Hz` / `48000 Hz`) with continuous clock-drift compensation so latency stays locked (~25 ms) over hours of playback.
+- **Adaptive Jitter Buffer & Fractional Resampler**: Automatically converts between macOS (`48000 Hz`) and Linux hardware sample rates (`44100 Hz` / `48000 Hz`) with continuous clock-drift compensation and configurable burst cap so latency stays locked (~20 ms).
+- **Smart Silence Pause (DTX)**: Automatically pauses UDP transmission (`0.0 kbps`) after `500 ms` when no sound is playing on your Mac, and resumes in `0 ms` the instant sound plays again.
 - **Smart Loopback Selection**:
   - **macOS**: Automatically selects virtual loopback drivers (`BlackHole 2ch`, `Loopback`, `Soundflower`) when sending desktop audio.
   - **Linux**: Automatically captures desktop audio from the default PulseAudio/PipeWire `.monitor` sink (or microphone with `--mic`).
@@ -49,11 +50,14 @@ lan-audio devices
 # Scan the local network for active receivers
 lan-audio discover
 
-# Start receiver (custom latency or volume)
-lan-audio recv --latency-ms 25 --volume 1.0
+# Start receiver (custom target latency, max burst cap, or volume)
+lan-audio recv --latency-ms 20 --max-latency-ms 45 --volume 1.0
 
-# Start sender (auto-discover receivers on LAN)
+# Start sender (auto-discover receivers on LAN, with automatic silence pause)
 lan-audio send
+
+# Start sender with continuous streaming even during silence
+lan-audio send --no-silence-pause
 
 # Start sender targeting a specific IP (or multiple IPs)
 lan-audio send --target 192.168.1.50

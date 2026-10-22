@@ -1,4 +1,4 @@
-use crate::protocol::{AudioHeader, Codec, PROTOCOL_VERSION};
+use crate::protocol::{AudioHeader, Codec, FLAG_STREAM_RESUMED, PROTOCOL_VERSION};
 use std::collections::VecDeque;
 
 const IMA_INDEX_TABLE: [i32; 16] = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
@@ -84,6 +84,7 @@ pub fn encode_audio_packet(
     codec: Codec,
     seq: u32,
     sample_rate: u32,
+    flags: u8,
     stereo_frames: &[[f32; 2]],
     adpcm_states: &mut [AdpcmChannelState; 2],
     out_buf: &mut Vec<u8>,
@@ -102,7 +103,7 @@ pub fn encode_audio_packet(
         version: PROTOCOL_VERSION,
         codec,
         channels: 2,
-        flags: 0,
+        flags,
         seq,
         sample_rate,
         frame_count,
@@ -225,6 +226,7 @@ pub struct JitterBuffer {
     sender_sample_rate: u32,
     output_sample_rate: u32,
     target_latency_ms: f32,
+    max_latency_ms: f32,
     smoothed_fill_frames: f32,
     resample_phase: f64,
     last_pushed_frame: [f32; 2],
@@ -238,13 +240,20 @@ pub struct JitterBuffer {
 }
 
 impl JitterBuffer {
-    pub fn new(output_sample_rate: u32, target_latency_ms: f32) -> Self {
+    pub fn new(output_sample_rate: u32, target_latency_ms: f32, max_latency_ms: Option<f32>) -> Self {
+        let target_clamped = target_latency_ms.clamp(5.0, 500.0);
+        let default_max = (target_clamped * 2.25).max(target_clamped + 20.0);
+        let max_clamped = max_latency_ms
+            .unwrap_or(default_max)
+            .max(target_clamped + 10.0)
+            .clamp(15.0, 1000.0);
         let cap = ((output_sample_rate as usize) * 2).max(16384);
         Self {
             queue: VecDeque::with_capacity(cap),
             sender_sample_rate: output_sample_rate,
             output_sample_rate,
-            target_latency_ms: target_latency_ms.clamp(5.0, 500.0),
+            target_latency_ms: target_clamped,
+            max_latency_ms: max_clamped,
             smoothed_fill_frames: 0.0,
             resample_phase: 0.0,
             last_pushed_frame: [0.0, 0.0],
@@ -260,6 +269,14 @@ impl JitterBuffer {
 
     pub fn sender_sample_rate(&self) -> u32 {
         self.sender_sample_rate
+    }
+
+    pub fn max_latency_ms(&self) -> f32 {
+        self.max_latency_ms
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.primed || !self.queue.is_empty()
     }
 
     pub fn current_latency_ms(&self) -> f32 {
@@ -278,7 +295,17 @@ impl JitterBuffer {
         }
         self.packets_received += 1;
 
-        if let Some(prev) = self.last_seq {
+        let target_frames =
+            ((self.target_latency_ms * 0.001) * (self.sender_sample_rate as f32)).max(360.0);
+
+        let stream_resumed = (hdr.flags & FLAG_STREAM_RESUMED) != 0
+            || (!self.primed && self.queue.is_empty());
+
+        let mut seam_crossfade = false;
+
+        if stream_resumed {
+            self.last_seq = Some(hdr.seq);
+        } else if let Some(prev) = self.last_seq {
             let expected = prev.wrapping_add(1);
             if hdr.seq != expected {
                 let forward_diff = hdr.seq.wrapping_sub(expected);
@@ -286,43 +313,56 @@ impl JitterBuffer {
                 if backward_diff < 500 && hdr.seq > 10 {
                     // Out-of-order or duplicate old packet: drop it so it doesn't corrupt timeline
                     return;
-                } else if forward_diff <= 6 {
-                    // 1..=6 packets lost over Wi-Fi: conceal missing frames smoothly so buffer doesn't dip
+                } else if forward_diff <= 4 {
                     self.packets_lost += forward_diff as u64;
-                    let missing_frames = (forward_diff as usize) * frames.len();
-                    let first_new = frames[0];
-                    for i in 0..missing_frames {
-                        let t = (i + 1) as f32 / (missing_frames + 1) as f32;
-                        let atten = 1.0 - (0.35 * t);
-                        let l = (self.last_pushed_frame[0]
-                            + (first_new[0] - self.last_pushed_frame[0]) * t)
-                            * atten;
-                        let r = (self.last_pushed_frame[1]
-                            + (first_new[1] - self.last_pushed_frame[1]) * t)
-                            * atten;
-                        self.queue.push_back([l, r]);
+                    // Sunshine/WebRTC-style: ONLY synthesize bridge frames if buffer is critically low (<50% target).
+                    // Never inflate an already-healthy buffer!
+                    if (self.queue.len() as f32) < target_frames * 0.5 {
+                        let missing_frames = ((forward_diff as usize) * frames.len()).min(240);
+                        let first_new = frames[0];
+                        for i in 0..missing_frames {
+                            let t = (i + 1) as f32 / (missing_frames + 1) as f32;
+                            let atten = 1.0 - (0.25 * t);
+                            let l = (self.last_pushed_frame[0]
+                                + (first_new[0] - self.last_pushed_frame[0]) * t)
+                                * atten;
+                            let r = (self.last_pushed_frame[1]
+                                + (first_new[1] - self.last_pushed_frame[1]) * t)
+                                * atten;
+                            self.queue.push_back([l, r]);
+                        }
+                    } else {
+                        seam_crossfade = true;
                     }
                 } else if forward_diff < 2000 {
                     self.packets_lost += forward_diff as u64;
+                    seam_crossfade = true;
                 }
             }
         }
         self.last_seq = Some(hdr.seq);
 
-        for &frame in frames {
-            self.queue.push_back(frame);
+        let crossfade_len = if seam_crossfade { frames.len().min(16) } else { 0 };
+        for (i, &frame) in frames.iter().enumerate() {
+            if i < crossfade_len {
+                let t = (i + 1) as f32 / (crossfade_len + 1) as f32;
+                self.queue.push_back([
+                    self.last_pushed_frame[0] * (1.0 - t) + frame[0] * t,
+                    self.last_pushed_frame[1] * (1.0 - t) + frame[1] * t,
+                ]);
+            } else {
+                self.queue.push_back(frame);
+            }
         }
         if let Some(&last) = frames.last() {
             self.last_pushed_frame = last;
         }
 
-        let target_frames =
-            ((self.target_latency_ms * 0.001) * (self.sender_sample_rate as f32)).max(480.0);
-        // Generous ceiling (~200ms or 5x target) so normal Wi-Fi bursts are absorbed by smooth resampling, not hard cuts
-        let max_frames = ((target_frames * 5.0) as usize).max((self.sender_sample_rate as usize) / 5);
+        let max_frames =
+            ((self.max_latency_ms * 0.001) * (self.sender_sample_rate as f32)).max(target_frames + 240.0) as usize;
 
         if self.queue.len() > max_frames {
-            let keep = (target_frames * 1.25) as usize;
+            let keep = (target_frames * 1.05) as usize;
             let drop_count = self.queue.len().saturating_sub(keep);
             self.queue.drain(..drop_count);
             // Crossfade the seam over 32 frames to prevent any click
@@ -338,7 +378,7 @@ impl JitterBuffer {
             self.smoothed_fill_frames = keep as f32;
         }
 
-        if !self.primed && (self.queue.len() as f32) >= target_frames {
+        if !self.primed && (self.queue.len() as f32) >= target_frames * 0.85 {
             self.primed = true;
             self.empty_run_frames = 0;
             self.smoothed_fill_frames = self.queue.len() as f32;
@@ -349,23 +389,34 @@ impl JitterBuffer {
     pub fn pop_output_frames(&mut self, out_frames: &mut [[f32; 2]], volume: f32) {
         if !self.primed {
             for frame in out_frames.iter_mut() {
-                self.last_frame[0] *= 0.992;
-                self.last_frame[1] *= 0.992;
+                if self.last_frame[0].abs() > 1e-6 || self.last_frame[1].abs() > 1e-6 {
+                    self.last_frame[0] *= 0.985;
+                    self.last_frame[1] *= 0.985;
+                } else {
+                    self.last_frame = [0.0, 0.0];
+                }
                 *frame = [self.last_frame[0] * volume, self.last_frame[1] * volume];
             }
             return;
         }
 
         // Ensure target_frames is always larger than 1.5x callback chunk size
-        let min_target = (out_frames.len() as f32 * 1.5).max(480.0);
+        let min_target = (out_frames.len() as f32 * 1.5).max(360.0);
         let target_frames = ((self.target_latency_ms * 0.001) * (self.sender_sample_rate as f32))
             .max(min_target);
         let current_fill = self.queue.len() as f32;
-        self.smoothed_fill_frames = 0.985 * self.smoothed_fill_frames + 0.015 * current_fill;
+        self.smoothed_fill_frames = 0.95 * self.smoothed_fill_frames + 0.05 * current_fill;
 
-        // Smooth proportional drift control (clamped to +/- 0.35% pitch shift)
+        // Two-stage proportional drift control:
+        // - Gentle +/- 0.35% within normal jitter window
+        // - Faster up to +1.25% catch-up if a Wi-Fi burst pushed fill > 1.25x target
         let fill_error = (self.smoothed_fill_frames - target_frames) / target_frames.max(1.0);
-        let drift_factor = (1.0 + (fill_error * 0.002).clamp(-0.0035, 0.0035)) as f64;
+        let adj = if fill_error > 0.25 {
+            (fill_error * 0.008).clamp(0.0, 0.0125)
+        } else {
+            (fill_error * 0.0025).clamp(-0.0035, 0.0035)
+        };
+        let drift_factor = (1.0 + adj) as f64;
         let base_ratio = (self.sender_sample_rate as f64) / (self.output_sample_rate.max(1) as f64);
         let step = base_ratio * drift_factor;
 
@@ -402,23 +453,28 @@ impl JitterBuffer {
                 self.queue.pop_front();
                 self.resample_phase = 0.0;
             } else {
-                // Momentary starvation: smoothly decay last sample without dropping `primed` unless stream stopped (>40ms)
+                // Momentary starvation or sender entered DTX silence pause
                 if self.empty_run_frames == 0 {
-                    had_underrun_in_chunk = true;
+                    // Only count as an underrun if the last played frame wasn't already near silence
+                    if self.last_frame[0].abs() > 0.001 || self.last_frame[1].abs() > 0.001 {
+                        had_underrun_in_chunk = true;
+                    }
                 }
                 self.empty_run_frames += 1;
-                self.last_frame[0] *= 0.994;
-                self.last_frame[1] *= 0.994;
+                self.last_frame[0] *= 0.990;
+                self.last_frame[1] *= 0.990;
                 *out = [
                     (self.last_frame[0] * volume).clamp(-1.0, 1.0),
                     (self.last_frame[1] * volume).clamp(-1.0, 1.0),
                 ];
                 self.resample_phase = 0.0;
 
-                // Only enter pre-buffering again if sender has stopped sending for >40ms
-                let max_empty = ((self.output_sample_rate as usize) / 25).max(1024);
+                // Enter idle/pre-buffering state if sender has paused sending for >35ms
+                let max_empty = ((self.output_sample_rate as usize) / 28).max(1024);
                 if self.empty_run_frames > max_empty {
                     self.primed = false;
+                    self.last_seq = None;
+                    self.smoothed_fill_frames = 0.0;
                 }
             }
         }
