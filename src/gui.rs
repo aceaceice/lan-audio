@@ -848,6 +848,11 @@ impl eframe::App for LanAudioGui {
                                     .fill(if sel { t.sound } else { t.bg2 });
                                     if ui.add(btn).clicked() {
                                         self.mac_route = mode_opt;
+                                        if let Some(ref mut sess) = self.session {
+                                            if let Some(ref mut guard) = sess.mac_guard {
+                                                guard.set_mode(mode_opt);
+                                            }
+                                        }
                                     }
                                 }
                             });

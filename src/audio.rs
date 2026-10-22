@@ -86,6 +86,26 @@ impl MacOutputGuard {
         }
     }
 
+    pub fn set_mode(&mut self, mode: MacRouteMode) {
+        #[cfg(target_os = "macos")]
+        {
+            if mode == MacRouteMode::Manual {
+                self.restore();
+                return;
+            }
+            if let Some((cur_id, cur_name, target_id, target_name)) =
+                macos_coreaudio::switch_output_for_mode(mode)
+            {
+                if self.original_device_id.is_none() && cur_id != target_id {
+                    self.original_device_id = Some(cur_id);
+                    self.original_name = Some(cur_name);
+                }
+                self.active_name = Some(target_name);
+            }
+        }
+        let _ = mode;
+    }
+
     pub fn restore(&mut self) {
         #[cfg(target_os = "macos")]
         if let Some(orig_id) = self.original_device_id.take() {
@@ -116,6 +136,9 @@ mod macos_coreaudio {
     const K_AUDIO_HARDWARE_PROPERTY_DEFAULT_SYSTEM_OUTPUT_DEVICE: u32 = u32::from_be_bytes(*b"sOut");
     const K_AUDIO_DEVICE_PROPERTY_DEVICE_NAME_CFSTRING: u32 = u32::from_be_bytes(*b"lnam");
     const K_AUDIO_DEVICE_PROPERTY_STREAM_CONFIGURATION: u32 = u32::from_be_bytes(*b"scfg");
+    const K_AUDIO_DEVICE_PROPERTY_TRANSPORT_TYPE: u32 = u32::from_be_bytes(*b"tran");
+    const K_AUDIO_TRANSPORT_TYPE_AGGREGATE: u32 = u32::from_be_bytes(*b"grup");
+    const K_AUDIO_TRANSPORT_TYPE_VIRTUAL: u32 = u32::from_be_bytes(*b"virt");
     const K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL: u32 = u32::from_be_bytes(*b"glob");
     const K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT: u32 = u32::from_be_bytes(*b"outp");
     const K_AUDIO_OBJECT_PROPERTY_ELEMENT_MASTER: u32 = 0;
@@ -225,6 +248,19 @@ mod macos_coreaudio {
         }
     }
 
+    #[repr(C)]
+    struct AudioBuffer {
+        m_number_channels: u32,
+        m_data_byte_size: u32,
+        m_data: *mut c_void,
+    }
+
+    #[repr(C)]
+    struct AudioBufferList {
+        m_number_buffers: u32,
+        m_buffers: [AudioBuffer; 1],
+    }
+
     fn device_has_output_streams(dev_id: u32) -> bool {
         let addr = AudioObjectPropertyAddress {
             m_selector: K_AUDIO_DEVICE_PROPERTY_STREAM_CONFIGURATION,
@@ -232,50 +268,107 @@ mod macos_coreaudio {
             m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MASTER,
         };
         let mut size: u32 = 0;
-        let status = unsafe {
-            AudioObjectGetPropertyDataSize(dev_id, &addr, 0, ptr::null(), &mut size)
-        };
-        // AudioBufferList with at least 1 buffer is > 8 bytes
-        status == 0 && size > 8
-    }
-
-    fn get_device_name(dev_id: u32) -> Option<String> {
-        let addr = AudioObjectPropertyAddress {
-            m_selector: K_AUDIO_DEVICE_PROPERTY_DEVICE_NAME_CFSTRING,
-            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
-            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MASTER,
-        };
-        let mut cf_str: *const c_void = ptr::null();
-        let mut size = mem::size_of::<*const c_void>() as u32;
         unsafe {
-            let status = AudioObjectGetPropertyData(
+            if AudioObjectGetPropertyDataSize(dev_id, &addr, 0, ptr::null(), &mut size) != 0
+                || (size as usize) < mem::size_of::<u32>()
+            {
+                return false;
+            }
+            let mut raw = vec![0u8; size as usize];
+            if AudioObjectGetPropertyData(
                 dev_id,
                 &addr,
                 0,
                 ptr::null(),
                 &mut size,
-                &mut cf_str as *mut *const c_void as *mut _,
-            );
-            if status != 0 || cf_str.is_null() {
-                return None;
+                raw.as_mut_ptr() as *mut _,
+            ) != 0
+            {
+                return false;
             }
-            let mut buf = [0 as c_char; 256];
-            let ok = CFStringGetCString(
-                cf_str,
-                buf.as_mut_ptr(),
-                buf.len() as isize,
-                K_CF_STRING_ENCODING_UTF8,
-            );
-            CFRelease(cf_str);
-            if ok != 0 {
-                Some(CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned())
-            } else {
-                None
+            let abl = &*(raw.as_ptr() as *const AudioBufferList);
+            if abl.m_number_buffers == 0 {
+                return false;
             }
+            let first = abl.m_buffers.as_ptr();
+            let buffers = std::slice::from_raw_parts(first, abl.m_number_buffers as usize);
+            let total_channels: u32 = buffers.iter().map(|b| b.m_number_channels).sum();
+            total_channels > 0
         }
     }
 
-    fn enumerate_output_devices() -> Vec<(u32, String)> {
+    fn get_device_transport_type(dev_id: u32) -> u32 {
+        let addr = AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_DEVICE_PROPERTY_TRANSPORT_TYPE,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MASTER,
+        };
+        let mut transport: u32 = 0;
+        let mut size = mem::size_of::<u32>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                dev_id,
+                &addr,
+                0,
+                ptr::null(),
+                &mut size,
+                &mut transport as *mut u32 as *mut _,
+            )
+        };
+        if status == 0 {
+            transport
+        } else {
+            0
+        }
+    }
+
+    fn get_device_name(dev_id: u32) -> Option<String> {
+        for scope in [
+            K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+        ] {
+            let addr = AudioObjectPropertyAddress {
+                m_selector: K_AUDIO_DEVICE_PROPERTY_DEVICE_NAME_CFSTRING,
+                m_scope: scope,
+                m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MASTER,
+            };
+            let mut cf_str: *const c_void = ptr::null();
+            let mut size = mem::size_of::<*const c_void>() as u32;
+            unsafe {
+                let status = AudioObjectGetPropertyData(
+                    dev_id,
+                    &addr,
+                    0,
+                    ptr::null(),
+                    &mut size,
+                    &mut cf_str as *mut *const c_void as *mut _,
+                );
+                if status == 0 && !cf_str.is_null() {
+                    let mut buf = [0 as c_char; 256];
+                    let ok = CFStringGetCString(
+                        cf_str,
+                        buf.as_mut_ptr(),
+                        buf.len() as isize,
+                        K_CF_STRING_ENCODING_UTF8,
+                    );
+                    CFRelease(cf_str);
+                    if ok != 0 {
+                        return Some(CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[derive(Clone, Debug)]
+    struct MacOutDev {
+        id: u32,
+        name: String,
+        transport: u32,
+    }
+
+    fn enumerate_output_devices() -> Vec<MacOutDev> {
         let addr = AudioObjectPropertyAddress {
             m_selector: K_AUDIO_HARDWARE_PROPERTY_DEVICES,
             m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
@@ -311,7 +404,12 @@ mod macos_coreaudio {
             for id in ids {
                 if device_has_output_streams(id) {
                     if let Some(name) = get_device_name(id) {
-                        out.push((id, name));
+                        let transport = get_device_transport_type(id);
+                        out.push(MacOutDev {
+                            id,
+                            name,
+                            transport,
+                        });
                     }
                 }
             }
@@ -323,18 +421,26 @@ mod macos_coreaudio {
         let orig_id = get_default_output_device()?;
         let orig_name = get_device_name(orig_id).unwrap_or_else(|| format!("Device #{}", orig_id));
 
+        let all_devs = enumerate_output_devices();
         let mut multi_dev: Option<(u32, String)> = None;
         let mut bh_dev: Option<(u32, String)> = None;
 
-        for (id, name) in enumerate_output_devices() {
-            let lower = name.to_lowercase();
-            if lower.contains("multi-output") || lower.contains("aggregate") {
-                multi_dev = Some((id, name));
-            } else if lower.contains("blackhole")
+        for d in &all_devs {
+            let lower = d.name.to_lowercase();
+            let is_blackhole = lower.contains("blackhole")
                 || lower.contains("loopback")
-                || lower.contains("soundflower")
+                || lower.contains("soundflower");
+            let is_multi = lower.contains("multi-output")
+                || lower.contains("multi output")
+                || lower.contains("aggregate")
+                || (d.transport == K_AUDIO_TRANSPORT_TYPE_AGGREGATE && !is_blackhole);
+
+            if is_multi {
+                multi_dev = Some((d.id, d.name.clone()));
+            } else if is_blackhole
+                || (d.transport == K_AUDIO_TRANSPORT_TYPE_VIRTUAL && bh_dev.is_none())
             {
-                bh_dev = Some((id, name));
+                bh_dev = Some((d.id, d.name.clone()));
             }
         }
 
@@ -342,10 +448,23 @@ mod macos_coreaudio {
             MacRouteMode::Auto | MacRouteMode::MultiOutput => multi_dev.or(bh_dev),
             MacRouteMode::PcOnly => bh_dev.or(multi_dev),
             MacRouteMode::Manual => None,
-        }?;
+        };
+
+        let Some(target) = target else {
+            let names: Vec<String> = all_devs.iter().map(|d| d.name.clone()).collect();
+            eprintln!(
+                "[!] macOS Auto-Route: Could not find Multi-Output or BlackHole device among outputs: {:?}",
+                names
+            );
+            return None;
+        };
 
         if target.0 != orig_id {
             if !set_default_output_device(target.0) {
+                eprintln!(
+                    "[!] macOS Auto-Route: CoreAudio failed to switch output to '{}' (id={})",
+                    target.1, target.0
+                );
                 return None;
             }
         }
