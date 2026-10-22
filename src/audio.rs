@@ -274,7 +274,7 @@ mod macos_coreaudio {
             {
                 return false;
             }
-            let mut raw = vec![0u8; size as usize];
+            let mut raw = vec![0u64; (size as usize + 7) / 8];
             if AudioObjectGetPropertyData(
                 dev_id,
                 &addr,

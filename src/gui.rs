@@ -28,7 +28,6 @@ pub enum GuiMode {
 
 struct ActiveSession {
     running: Arc<AtomicBool>,
-    mac_guard: Option<MacOutputGuard>,
     _cpal_stream: Option<cpal::Stream>,
     // Shared telemetry
     peak_bits: Arc<AtomicU32>,
@@ -46,9 +45,6 @@ struct ActiveSession {
 impl Drop for ActiveSession {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
-        if let Some(ref mut g) = self.mac_guard {
-            g.restore();
-        }
     }
 }
 
@@ -59,6 +55,7 @@ pub struct LanAudioGui {
 
     mode: GuiMode,
     mac_route: MacRouteMode,
+    mac_guard: MacOutputGuard,
     codec: Codec,
     silence_pause: Arc<AtomicBool>,
     use_mic: bool,
@@ -98,6 +95,7 @@ impl LanAudioGui {
             last_reload_flash: None,
             mode: initial_mode,
             mac_route: MacRouteMode::Auto,
+            mac_guard: MacOutputGuard::activate(MacRouteMode::Manual),
             codec: Codec::PcmI16,
             silence_pause: Arc::new(AtomicBool::new(true)),
             use_mic: false,
@@ -135,12 +133,10 @@ impl LanAudioGui {
     }
 
     fn stop_session(&mut self) {
-        if let Some(mut sess) = self.session.take() {
+        if let Some(sess) = self.session.take() {
             sess.running.store(false, Ordering::Relaxed);
-            if let Some(ref mut g) = sess.mac_guard {
-                g.restore();
-            }
         }
+        self.mac_guard.restore();
         self.current_kbps = 0.0;
         self.prev_bytes = 0;
     }
@@ -165,7 +161,7 @@ impl LanAudioGui {
 
     fn start_sender_session(&mut self) -> Result<(), String> {
         let running = Arc::new(AtomicBool::new(true));
-        let mac_guard = MacOutputGuard::activate(self.mac_route);
+        self.mac_guard.set_mode(self.mac_route);
 
         let receivers: Arc<Mutex<HashMap<SocketAddr, DiscoveredReceiver>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -246,7 +242,7 @@ impl LanAudioGui {
             cpal_stream = Some(stream);
         }
 
-        if let (Some(orig), Some(act)) = (&mac_guard.original_name, &mac_guard.active_name) {
+        if let (Some(orig), Some(act)) = (&self.mac_guard.original_name, &self.mac_guard.active_name) {
             if orig != act {
                 status_note = format!("{} | Routed: {} -> {}", status_note, orig, act);
             }
@@ -351,7 +347,6 @@ impl LanAudioGui {
 
         self.session = Some(ActiveSession {
             running,
-            mac_guard: Some(mac_guard),
             _cpal_stream: cpal_stream,
             peak_bits,
             packets,
@@ -496,7 +491,6 @@ impl LanAudioGui {
 
         self.session = Some(ActiveSession {
             running,
-            mac_guard: None,
             _cpal_stream: cpal_stream,
             peak_bits,
             packets,
@@ -848,11 +842,7 @@ impl eframe::App for LanAudioGui {
                                     .fill(if sel { t.sound } else { t.bg2 });
                                     if ui.add(btn).clicked() {
                                         self.mac_route = mode_opt;
-                                        if let Some(ref mut sess) = self.session {
-                                            if let Some(ref mut guard) = sess.mac_guard {
-                                                guard.set_mode(mode_opt);
-                                            }
-                                        }
+                                        self.mac_guard.set_mode(mode_opt);
                                     }
                                 }
                             });
