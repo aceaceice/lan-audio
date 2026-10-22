@@ -106,15 +106,20 @@ impl Drop for MacOutputGuard {
 #[cfg(target_os = "macos")]
 mod macos_coreaudio {
     use super::MacRouteMode;
-    use cpal::traits::{DeviceTrait, HostTrait};
+    use std::ffi::{c_char, c_void, CStr};
     use std::mem;
     use std::ptr;
 
     const K_AUDIO_OBJECT_SYSTEM_OBJECT: u32 = 1;
-    const K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE: u32 = 0x644F_7574; // 'dOut'
-    const K_AUDIO_HARDWARE_PROPERTY_DEFAULT_SYSTEM_OUTPUT_DEVICE: u32 = 0x734F_7574; // 'sOut'
-    const K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL: u32 = 0x676C_6F62; // 'glob'
+    const K_AUDIO_HARDWARE_PROPERTY_DEVICES: u32 = u32::from_be_bytes(*b"dev#");
+    const K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE: u32 = u32::from_be_bytes(*b"dOut");
+    const K_AUDIO_HARDWARE_PROPERTY_DEFAULT_SYSTEM_OUTPUT_DEVICE: u32 = u32::from_be_bytes(*b"sOut");
+    const K_AUDIO_DEVICE_PROPERTY_DEVICE_NAME_CFSTRING: u32 = u32::from_be_bytes(*b"lnam");
+    const K_AUDIO_DEVICE_PROPERTY_STREAM_CONFIGURATION: u32 = u32::from_be_bytes(*b"scfg");
+    const K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL: u32 = u32::from_be_bytes(*b"glob");
+    const K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT: u32 = u32::from_be_bytes(*b"outp");
     const K_AUDIO_OBJECT_PROPERTY_ELEMENT_MASTER: u32 = 0;
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
     #[repr(C)]
     struct AudioObjectPropertyAddress {
@@ -124,24 +129,42 @@ mod macos_coreaudio {
     }
 
     #[link(name = "CoreAudio", kind = "framework")]
+    #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
+        fn AudioObjectGetPropertyDataSize(
+            in_object_id: u32,
+            in_address: *const AudioObjectPropertyAddress,
+            in_qualifier_data_size: u32,
+            in_qualifier_data: *const c_void,
+            out_data_size: *mut u32,
+        ) -> i32;
+
         fn AudioObjectGetPropertyData(
             in_object_id: u32,
             in_address: *const AudioObjectPropertyAddress,
             in_qualifier_data_size: u32,
-            in_qualifier_data: *const std::ffi::c_void,
+            in_qualifier_data: *const c_void,
             io_data_size: *mut u32,
-            out_data: *mut std::ffi::c_void,
+            out_data: *mut c_void,
         ) -> i32;
 
         fn AudioObjectSetPropertyData(
             in_object_id: u32,
             in_address: *const AudioObjectPropertyAddress,
             in_qualifier_data_size: u32,
-            in_qualifier_data: *const std::ffi::c_void,
+            in_qualifier_data: *const c_void,
             in_data_size: u32,
-            in_data: *const std::ffi::c_void,
+            in_data: *const c_void,
         ) -> i32;
+
+        fn CFStringGetCString(
+            the_string: *const c_void,
+            buffer: *mut c_char,
+            buffer_size: isize,
+            encoding: u32,
+        ) -> u8;
+
+        fn CFRelease(cf: *const c_void);
     }
 
     pub fn get_default_output_device() -> Option<u32> {
@@ -202,41 +225,116 @@ mod macos_coreaudio {
         }
     }
 
-    fn extract_device_id(dev: &cpal::Device) -> Option<u32> {
-        // cpal::Device Debug format on macOS: `Device { audio_device_id: 73, name: Ok("...") }`
-        let dbg = format!("{:?}", dev);
-        let marker = "audio_device_id:";
-        let idx = dbg.find(marker)?;
-        let rest = dbg[idx + marker.len()..].trim_start();
-        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        num_str.parse::<u32>().ok()
+    fn device_has_output_streams(dev_id: u32) -> bool {
+        let addr = AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_DEVICE_PROPERTY_STREAM_CONFIGURATION,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MASTER,
+        };
+        let mut size: u32 = 0;
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(dev_id, &addr, 0, ptr::null(), &mut size)
+        };
+        // AudioBufferList with at least 1 buffer is > 8 bytes
+        status == 0 && size > 8
+    }
+
+    fn get_device_name(dev_id: u32) -> Option<String> {
+        let addr = AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_DEVICE_PROPERTY_DEVICE_NAME_CFSTRING,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MASTER,
+        };
+        let mut cf_str: *const c_void = ptr::null();
+        let mut size = mem::size_of::<*const c_void>() as u32;
+        unsafe {
+            let status = AudioObjectGetPropertyData(
+                dev_id,
+                &addr,
+                0,
+                ptr::null(),
+                &mut size,
+                &mut cf_str as *mut *const c_void as *mut _,
+            );
+            if status != 0 || cf_str.is_null() {
+                return None;
+            }
+            let mut buf = [0 as c_char; 256];
+            let ok = CFStringGetCString(
+                cf_str,
+                buf.as_mut_ptr(),
+                buf.len() as isize,
+                K_CF_STRING_ENCODING_UTF8,
+            );
+            CFRelease(cf_str);
+            if ok != 0 {
+                Some(CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        }
+    }
+
+    fn enumerate_output_devices() -> Vec<(u32, String)> {
+        let addr = AudioObjectPropertyAddress {
+            m_selector: K_AUDIO_HARDWARE_PROPERTY_DEVICES,
+            m_scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            m_element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MASTER,
+        };
+        let mut size: u32 = 0;
+        unsafe {
+            if AudioObjectGetPropertyDataSize(
+                K_AUDIO_OBJECT_SYSTEM_OBJECT,
+                &addr,
+                0,
+                ptr::null(),
+                &mut size,
+            ) != 0
+                || size == 0
+            {
+                return Vec::new();
+            }
+            let count = (size as usize) / mem::size_of::<u32>();
+            let mut ids = vec![0u32; count];
+            if AudioObjectGetPropertyData(
+                K_AUDIO_OBJECT_SYSTEM_OBJECT,
+                &addr,
+                0,
+                ptr::null(),
+                &mut size,
+                ids.as_mut_ptr() as *mut _,
+            ) != 0
+            {
+                return Vec::new();
+            }
+            let mut out = Vec::new();
+            for id in ids {
+                if device_has_output_streams(id) {
+                    if let Some(name) = get_device_name(id) {
+                        out.push((id, name));
+                    }
+                }
+            }
+            out
+        }
     }
 
     pub fn switch_output_for_mode(mode: MacRouteMode) -> Option<(u32, String, u32, String)> {
-        let host = cpal::default_host();
         let orig_id = get_default_output_device()?;
-        let orig_name = host
-            .default_output_device()
-            .and_then(|d| d.name().ok())
-            .unwrap_or_else(|| format!("Device #{}", orig_id));
+        let orig_name = get_device_name(orig_id).unwrap_or_else(|| format!("Device #{}", orig_id));
 
         let mut multi_dev: Option<(u32, String)> = None;
         let mut bh_dev: Option<(u32, String)> = None;
 
-        if let Ok(devs) = host.output_devices() {
-            for d in devs {
-                let name = d.name().unwrap_or_default();
-                let lower = name.to_lowercase();
-                if let Some(id) = extract_device_id(&d) {
-                    if lower.contains("multi-output") || lower.contains("aggregate") {
-                        multi_dev = Some((id, name));
-                    } else if lower.contains("blackhole")
-                        || lower.contains("loopback")
-                        || lower.contains("soundflower")
-                    {
-                        bh_dev = Some((id, name));
-                    }
-                }
+        for (id, name) in enumerate_output_devices() {
+            let lower = name.to_lowercase();
+            if lower.contains("multi-output") || lower.contains("aggregate") {
+                multi_dev = Some((id, name));
+            } else if lower.contains("blackhole")
+                || lower.contains("loopback")
+                || lower.contains("soundflower")
+            {
+                bh_dev = Some((id, name));
             }
         }
 

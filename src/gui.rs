@@ -209,6 +209,7 @@ impl LanAudioGui {
         let preferred_rate = 48000u32;
         let mut sample_rate = preferred_rate;
         let mut cpal_stream: Option<cpal::Stream> = None;
+        #[allow(unused_mut)]
         let mut pulse_started = false;
         let mut status_note = String::new();
 
@@ -390,6 +391,7 @@ impl LanAudioGui {
         };
 
         let mut cpal_stream: Option<cpal::Stream> = None;
+        #[allow(unused_mut)]
         let mut pulse_started = false;
         let mut actual_rate = output_rate;
         let mut status_note = String::new();
